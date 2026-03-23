@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""
+Бот для пересылки сообщений из VK в Telegram
+"""
+
+import asyncio
+import logging
+from datetime import datetime
+import vk_api
+from vk_api.longpoll import VkLongPoll, VkEventType
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler
+
+# ==================== НАСТРОЙКИ ====================
+# Telegram настройки
+TG_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TG_CHAT_ID = -1003893183755  # ID чата или пользователя в Telegram
+
+# VK настройки
+VK_TOKEN = "vk1.a.YOUR_VK_TOKEN"
+VK_GROUP_ID = 123456789  # ID группы или пользователя VK
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ==================== ТЕЛЕГРАМ БОТ (для команд) ====================
+tg_bot = Bot(token=TG_BOT_TOKEN)
+
+async def start(update: Update, context):
+    """Обработчик команды /start"""
+    await update.message.reply_text(
+        "👋 Привет! Я бот для пересылки сообщений из ВКонтакте в Telegram.\n\n"
+        "📨 Все новые сообщения из VK будут автоматически пересылаться сюда.\n"
+        "⚙️ Для настройки используйте команды:\n"
+        "/status - статус бота\n"
+        "/test - тестовое сообщение"
+    )
+
+async def status(update: Update, context):
+    """Проверка статуса"""
+    await update.message.reply_text(
+        "✅ Бот работает!\n"
+        f"📱 Telegram: @{(await tg_bot.get_me()).username}\n"
+        f"💬 VK ID: {VK_GROUP_ID}\n"
+        f"🕐 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+    )
+
+async def test(update: Update, context):
+    """Тестовая команда"""
+    await update.message.reply_text("✅ Бот активен и готов к работе!")
+
+# ==================== VK ЛОНГПОЛЛ ====================
+def format_message(event, user_info=None):
+    """Форматирует сообщение из VK для отправки в Telegram"""
+    text = f"📩 **Новое сообщение из VK**\n\n"
+    
+    # Информация об отправителе
+    if user_info:
+        name = f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip()
+        if name:
+            text += f"👤 **От:** {name}\n"
+        if user_info.get('id'):
+            text += f"🆔 ID: {user_info.get('id')}\n"
+    
+    text += f"📝 **Текст:**\n{event.text}\n\n"
+    text += f"🕐 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+    
+    return text
+
+def process_vk_messages():
+    """Основной цикл обработки сообщений VK"""
+    try:
+        # Авторизация в VK
+        vk_session = vk_api.VkApi(token=VK_TOKEN)
+        vk = vk_session.get_api()
+        longpoll = VkLongPoll(vk_session)
+        
+        logger.info("🚀 VK LongPoll запущен")
+        
+        for event in longpoll.listen():
+            if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+                try:
+                    # Получаем информацию о пользователе
+                    user_info = None
+                    try:
+                        user_info = vk.users.get(user_ids=event.user_id)[0]
+                    except:
+                        pass
+                    
+                    # Форматируем сообщение
+                    text = format_message(event, user_info)
+                    
+                    # Отправляем в Telegram
+                    asyncio.run_coroutine_threadsafe(
+                        tg_bot.send_message(chat_id=TG_CHAT_ID, text=text, parse_mode='Markdown'),
+                        loop
+                    )
+                    logger.info(f"✅ Сообщение от {event.user_id} переслано в Telegram")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Ошибка при обработке сообщения: {e}")
+                    
+    except Exception as e:
+        logger.error(f"❌ Ошибка VK LongPoll: {e}")
+        raise
+
+# ==================== ЗАПУСК ====================
+async def main():
+    """Главная функция"""
+    global loop
+    loop = asyncio.get_event_loop()
+    
+    # Запускаем Telegram бота
+    tg_application = Application.builder().token(TG_BOT_TOKEN).build()
+    tg_application.add_handler(CommandHandler("start", start))
+    tg_application.add_handler(CommandHandler("status", status))
+    tg_application.add_handler(CommandHandler("test", test))
+    
+    # Запускаем Telegram бота в фоне
+    asyncio.create_task(tg_application.initialize())
+    asyncio.create_task(tg_application.start())
+    
+    logger.info("=" * 50)
+    logger.info("🚀 Бот для пересылки VK → Telegram запущен")
+    logger.info(f"🤖 Telegram Bot: @{(await tg_bot.get_me()).username}")
+    logger.info(f"💬 VK Group ID: {VK_GROUP_ID}")
+    logger.info("=" * 50)
+    
+    # Запускаем VK LongPoll в отдельном потоке
+    import threading
+    vk_thread = threading.Thread(target=process_vk_messages, daemon=True)
+    vk_thread.start()
+    
+    # Держим бота активным
+    while True:
+        await asyncio.sleep(1)
+
+if __name__ "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Бот остановлен")
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка: {e}")
