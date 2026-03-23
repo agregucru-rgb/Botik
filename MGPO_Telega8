@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+Бот для пересылки сообщений внутри Telegram
+"""
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Optional
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes
+)
+
+# ==================== НАСТРОЙКИ ====================
+BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+
+# Куда пересылать
+DESTINATION_CHAT_ID = -1003893183755  # ID канала или группы
+# Если None, то бот будет пересылать в чат, указанный в команде /setdest
+
+# Откуда пересылать (если указать None, то бот будет ждать команду /start)
+SOURCE_CHAT_IDS = []  # Список ID чатов, из которых пересылать
+
+# Настройки модерации
+ADMIN_IDS = []  # ID администраторов
+REQUIRE_APPROVAL = False  # Требовать ли подтверждение перед пересылкой
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Хранилище для временных данных
+pending_messages = {}  # {message_id: (user_id, chat_id, message)}
+forward_destinations = {}  # {user_id: destination_chat_id}
+
+# ==================== КЛАВИАТУРЫ ====================
+def get_approval_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура для подтверждения пересылки"""
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Отправить", callback_data=f"approve_{message_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{message_id}")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Главная клавиатура"""
+    dest = forward_destinations.get(user_id)
+    status = "✅ Активен" if dest else "❌ Не настроен"
+    dest_text = f"📤 В чат {dest}" if dest else "Не задан"
+    
+    keyboard = [
+        [InlineKeyboardButton("📋 Статус", callback_data="status")],
+        [InlineKeyboardButton("📤 Настроить назначение", callback_data="set_destination")],
+        [InlineKeyboardButton("🔄 Выбрать другой чат", callback_data="change_destination")],
+        [InlineKeyboardButton("⏸️ Остановить", callback_data="stop_forwarding")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ==================== ОБРАБОТЧИКИ ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user = update.effective_user
+    logger.info(f"Пользователь {user.id} (@{user.username}) запустил бота")
+    
+    text = (
+        f"👋 Привет, {user.first_name}!\n\n"
+        "Я бот для пересылки сообщений.\n\n"
+        "**Что я умею:**\n"
+        "• Пересылать сообщения из одного чата в другой\n"
+        "• Пересылать личные сообщения в канал или группу\n"
+        "• Одобрять или отклонять сообщения перед отправкой (если включено)\n\n"
+        "**Команды:**\n"
+        "/start - запустить бота\n"
+        "/status - статус пересылки\n"
+        "/setdest <chat_id> - установить чат назначения\n"
+        "/stop - остановить пересылку\n"
+        "/help - справка\n\n"
+        "Используйте кнопки ниже для управления 👇"
+    )
+    
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=get_main_keyboard(user.id))
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Справка"""
+    help_text = (
+        "🔍 **Справка:**\n\n"
+        "**Настройка назначения:**\n"
+        "1. Узнайте ID нужного чата (можно через @userinfobot)\n"
+        "2. Отправьте команду /setdest -1001234567890\n"
+        "3. Бот будет пересылать все сообщения в этот чат\n\n"
+        "**Режимы работы:**\n"
+        "• Если бот добавлен в группу — пересылает сообщения из этой группы\n"
+        "• В личных сообщениях — пересылает всё, что вы пишете\n\n"
+        "**Для администраторов:**\n"
+        "• Включить модерацию: /moderation on\n"
+        "• Выключить модерацию: /moderation off\n"
+        "• Посмотреть очередь: /pending"
+    )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def set_destination(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Установка чата назначения"""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text(
+            "📤 **Укажите ID чата назначения:**\n"
+            "/setdest -1001234567890\n\n"
+            "Чтобы узнать ID чата, добавьте бота @userinfobot и перешлите сообщение из нужного чата"
+        )
+        return
+    
+    try:
+        dest_id = int(context.args[0])
+        forward_destinations[user_id] = dest_id
+        await update.message.reply_text(
+            f"✅ Чат назначения установлен: `{dest_id}`\n"
+            f"Все сообщения теперь будут пересылаться сюда.",
+            parse_mode='Markdown'
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат ID. Используйте /setdest -1001234567890")
+
+async def stop_forwarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Остановка пересылки"""
+    user_id = update.effective_user.id
+    if user_id in forward_destinations:
+        del forward_destinations[user_id]
+    await update.message.reply_text("⏸️ Пересылка остановлена. Чтобы возобновить, используйте /setdest")
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статус пересылки"""
+    user_id = update.effective_user.id
+    dest = forward_destinations.get(user_id)
+    
+    if dest:
+        status_text = (
+            "✅ **Пересылка активна**\n\n"
+            f"📤 **Чат назначения:** `{dest}`\n"
+            f"🔄 **Модерация:** {'Включена' if REQUIRE_APPROVAL else 'Выключена'}\n"
+            f"👥 **Администраторы:** {len(ADMIN_IDS)}\n"
+            f"🕐 **Время:** {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+        )
+    else:
+        status_text = "⏸️ **Пересылка не настроена**\n\nИспользуйте /setdest <chat_id> для настройки"
+    
+    await update.message.reply_text(status_text, parse_mode='Markdown', reply_markup=get_main_keyboard(user_id))
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик сообщений"""
+    message = update.message
+    user = message.from_user
+    chat = message.chat
+    user_id = user.id
+    chat_id = chat.id
+    
+    # Определяем, нужно ли пересылать это сообщение
+    dest_id = forward_destinations.get(user_id)
+    
+    # Если назначение не установлено, игнорируем
+    if not dest_id:
+        return
+    
+    # Если заданы источники и текущий чат не в списке — игнорируем
+    if SOURCE_CHAT_IDS and chat_id not in SOURCE_CHAT_IDS:
+        return
+    
+    # Если требуется одобрение
+    if REQUIRE_APPROVAL and user_id not in ADMIN_IDS:
+        pending_messages[message.message_id] = (user_id, chat_id, message)
+        
+        for admin_id in ADMIN_IDS:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"📨 **Новое сообщение на модерацию**\n\n"
+                     f"👤 От: @{user.username or user.first_name}\n"
+                     f"📝 Текст: {message.text or '[не текст]'}\n"
+                     f"🔢 ID: {message.message_id}",
+                reply_markup=get_approval_keyboard(message.message_id)
+            )
+        return
+    
+    # Пересылаем сообщение
+    await forward_message(context, message, dest_id, user)
+
+async def forward_message(context: ContextTypes.DEFAULT_TYPE, message, dest_id: int, user):
+    """Пересылка сообщения"""
+    try:
+        if message.text:
+            text = f"📩 **Переслано от @{user.username or user.first_name}**\n\n{message.text}"
+            await context.bot.send_message(chat_id=dest_id, text=text, parse_mode='Markdown')
+        elif message.photo:
+            await context.bot.send_photo(
+                chat_id=dest_id,
+                photo=message.photo[-1].file_id,
+                caption=f"📸 **Фото от @{user.username or user.first_name}**"
+            )
+        elif message.video:
+            await context.bot.send_video(
+                chat_id=dest_id,
+                video=message.video.file_id,
+                caption=f"🎥 **Видео от @{user.username or user.first_name}**"
+            )
+        else:
+            # Другие типы сообщений
+            await context.bot.forward_message(
+                chat_id=dest_id,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id
+            )
+        
+        logger.info(f"✅ Сообщение от {user.id} переслано в {dest_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка пересылки: {e}")
+        await message.reply_text(f"❌ Ошибка при пересылке: {str(e)[:100]}")
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    if data == "status":
+        await status(update, context)
+        
+    elif data == "set_destination" or data == "change_destination":
+        await query.edit_message_text(
+            "📤 **Настройка назначения**\n\n"
+            "Чтобы установить чат назначения, используйте команду:\n"
+            "/setdest <chat_id>\n\n"
+            "Узнать ID чата можно через @userinfobot"
+        )
+        
+    elif data == "stop_forwarding":
+        await stop_forwarding(update, context)
+        
+    elif data.startswith("approve_"):
+        msg_id = int(data.split("_")[1])
+        if msg_id in pending_messages:
+            user_id, chat_id, msg = pending_messages[msg_id]
+            dest_id = forward_destinations.get(user_id)
+            if dest_id:
+                await forward_message(context, msg, dest_id, msg.from_user)
+                del pending_messages[msg_id]
+                await query.edit_message_text("✅ Сообщение одобрено и отправлено")
+            else:
+                await query.edit_message_text("❌ Чат назначения не настроен")
+                
+    elif data.startswith("reject_"):
+        msg_id = int(data.split("_")[1])
+        if msg_id in pending_messages:
+            del pending_messages[msg_id]
+            await query.edit_message_text("❌ Сообщение отклонено")
+    
+    await query.answer()
+
+# ==================== ЗАПУСК ====================
+def main():
+    """Запуск бота"""
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Команды
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("setdest", set_destination))
+    application.add_handler(CommandHandler("stop", stop_forwarding))
+    
+    # Обработчики сообщений
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_message))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_message))
+    
+    # Обработчик кнопок
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    
+    logger.info("🚀 Бот для пересылки сообщений запущен")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
